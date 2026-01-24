@@ -1,0 +1,474 @@
+---
+title: "Initial MFJD CJS Analysis"
+subtitle: "For Lindsy Ciepiela & Matt Kaylor"
+author: "Code by Ben Staton (CRITFC)"
+date: "Updated `r Sys.Date()`"
+output: 
+  html_document:
+    code_folding: hide
+params:
+  fit_year:
+    value: 2023
+  run_jags:
+    value: FALSE
+  save_post:
+    value: FALSE
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+#.libPaths("C:/Packages") 
+
+knitr::opts_chunk$set(echo = TRUE, fig.align = "center")
+```
+
+# Session Preparation
+
+Needed packages and functions.
+
+```{r session-prep, message = FALSE}
+# load packages
+library(jagsUI)
+library(postpack)
+library(tidyverse)
+
+# necessary function
+# fills in the true state matrix for elements we know 
+# each individual must have been alive
+# we pass these as data for the z matrix
+
+# example of what the function does
+#ex_y_i = c(1, 0, 0, 1, 0, 0)
+#ex_y_i; known_alive(ex_y_i)
+
+known_alive = function(y_i) {
+  f_alive = min(which(y_i == 1))
+  l_alive = max(which(y_i == 1))
+  z = rep(NA, length(y_i))
+  z[f_alive:l_alive] = 1
+  z
+}
+```
+
+# Data Preparation
+
+This section prepares the data into two data frames: `detections` and `covariates`
+
+```{r data-prep}
+setwd("D:/2024_30Mile_Pub/R/Thirtymile_SMB_reduction/Survival/RMark_DataFrame")
+# read in raw data file and view it
+dat = readRDS("Thirtymile_RMarkDF.rds")
+
+unique(dat$mark.sample.site)
+unique(dat$mark.section)
+#Estimate survival based on section, except for the mouth, split the mouth into below, above and bass
+
+#Lump all spring tagged fish into one section "Spring"
+ dat <- dat %>% mutate(mark.section = case_when(
+   mark.season == "Spring" ~ "Spring", 
+   TRUE ~ mark.section
+ ))
+
+
+dat$mark.siteseason <- paste(dat$mark.section, dat$mark.season,  sep = "_")
+
+#Remove fish tagged in the current year [i.e. 2024] becuase they haven't had a chance to outmigrate yet. 
+dat <- dat %>% filter (mark.year != 2024) 
+
+##Establish a false year to combine tagging events accross all years
+#dat$mark.year <- 9999
+
+unique(dat$mark.siteseason)
+
+
+# replace "." with "_" in column names
+
+colnames(dat) = stringr::str_replace_all(colnames(dat), "\\.", "_")
+
+# make column names lower case
+colnames(dat) = tolower(colnames(dat))
+
+
+# select correct detection columns
+dat <- dat %>% select (mark, out_jdd, out_bonneville, out_estuary, in_bonneville, mark_siteseason, mark_year) %>% rename ("mark_site" = "mark_siteseason")
+
+# keep only the mark site abbreviation
+dat$mark_site = stringr::str_remove(dat$mark_site, " -.+")
+
+unique(dat$mark_site)
+
+# which sites to retain -- taken from initial model code
+#Turn the below on and off, depending on what tags were run in in which years.
+keep_sites = c("Spring_Spring", 
+                "Per2_Fall", 
+                "MO_below_Fall",
+                "Per3_Fall",
+                "MO_above_Fall",
+                "PF4_Fall"
+                )
+
+# keep only fish marked at these sites
+dat = subset(dat, mark_site %in% keep_sites)
+
+# convert tag site to a factor, order is defined above
+dat$mark_site = factor(dat$mark_site, levels = keep_sites)
+
+# extract only the detection history matrix
+detections = dat[,stringr::str_detect(colnames(dat), "^mark$|out|in")]
+
+# extract only the covariate matrix
+covariates = dat[,stringr::str_detect(colnames(dat), "^mark_")]
+
+setwd("D:/2024_30Mile_Pub/R/Thirtymile_SMB_reduction/Survival/Modeled_Survival")
+```
+
+How many tags per site/year?
+
+```{r count-tags}
+(SampleSizes<- with(covariates, table(mark_site, mark_year)))
+#write.csv(SampleSizes, "SampleSizes.csv")
+
+```
+
+# JAGS Analysis
+
+**NOTE**: _This analysis fits only to data from mark year `r params$fit_year`_
+
+### Step 1: Prepare Data for JAGS
+
+Specify a function to prepare the data for a single year:
+
+```{r jags-data-fn}
+# a function to create the jags_data list for one year
+make_jags_data = function(year) {
+  
+  # subset out only the data for this year
+  detections_year = detections[covariates$mark_year == year,]
+  covariates_year = covariates[covariates$mark_year == year,]
+  
+  # drop factor levels not included in the data set
+  # i.e., drop out mark_sites with no tagged fish this year
+  covariates_year = droplevels(covariates_year)
+  
+  # compile data objects into a list
+  jags_data = list(
+    
+    # dimensions
+    n = nrow(detections_year),
+    J = ncol(detections_year), 
+    S = length(levels(covariates_year$mark_site)),
+    
+    # observations
+    y = as.matrix(detections_year),
+    
+    # "covariates"
+    mark_site = as.numeric(covariates_year$mark_site)
+  )
+  
+  # add in the filled-in z matrix
+  # these are events we know the fish was alive
+  # so no need for JAGS to treat them as stochastic nodes
+  jags_data = append(jags_data, list(z = t(apply(jags_data$y, 1, known_alive))))
+  
+  # return output object
+  return(jags_data)
+}
+```
+
+And apply the function and extract the names of the mark sites that year.
+
+```{r jags-data}
+jags_data = make_jags_data(params$fit_year)
+
+# create the names of the mark sites for this year
+site_names = levels(droplevels(covariates$mark_site[covariates$mark_year == params$fit_year]))
+
+# create the names of the detection sites
+event_names = substr(colnames(detections)[-1], 1, 7)
+```
+
+## Step 2: Specify JAGS Model Code
+
+Three things to note:
+
+1. I've set `phi[1:S,1] = 1` (survival to the marking event). This isn't used by the model (process/observation equations start at `j=2`), but makes calculating surviorship much easier.
+2. I've set `p[J] = 1` (detection probability for returning adults at BON). Survival and detection in the last event are confounded, and only their product is estimable. Additionally, there are no detections at this last event for any mark site in any year.
+3. The key to selecting the correct mark site-specific survival term to use for a given individual is to use the nested index: `phi[mark_site[i],j]`: `mark_site` is a numeric vector of site identifiers (one per fish) and this says to extract the survival term that corresponds to the mark site for fish `i` to event `j`.
+
+```{r jags-code}
+jags_model = function() {
+  
+  # PRIORS: SURVIVAL
+  # different survival rates for each event and mark site
+  for (s in 1:S) {
+    # set "survival to marking period" equal to 1
+    phi[s,1] <- 1
+    for (j in 2:J) {
+      # freely estimate all others
+      phi[s,j] ~ dbeta(1,1)
+    }
+  }
+
+  # PRIORS: DETECTION
+  # different detection rates for each event, common across mark sites
+  for (j in 2:(J-1)) {
+    p[j] ~ dbeta(1,1)
+  }
+  
+  # set the last detection probability to 1
+  # this is In.Bonneville, should be near 1 and prevents confounding
+  p[J] <- 1
+  
+  # LIKELIHOOD
+  for (i in 1:n) {
+    for (j in 2:J) {
+      # survival process
+      z[i,j] ~ dbern(z[i,j-1] * phi[mark_site[i],j])
+      
+      # detection process
+      y[i,j] ~ dbern(z[i,j] * p[j])
+    }
+  }
+  
+  # calculate survivorship
+  # probability of surviving from tagging to any subsequent event
+  for (s in 1:S) {
+    for (j in 1:J) {
+      sship[s,j] <- prod(phi[s,1:j])
+    }
+  }
+}
+
+# write the model code out to a text file to be read by JAGS
+jags_file = "model.txt"
+write_model(jags_model, jags_file)
+
+# create a file name for the posterior samples
+post_name = paste0("post_", params$fit_year, ".rds")
+```
+
+## Step 3: Specify Initial Values
+
+Skip this for now -- the model is simple enough to not need it.
+
+```{r jags-inits}
+jags_inits = function(chain) {
+  NULL
+}
+```
+
+## Step 4: Set Nodes to Monitor
+
+There is little point in monitoring `z`.
+
+```{r jags-params}
+jags_params = c("phi", "p", "sship")
+```
+
+## Step 5: Specify MCMC Dimensions
+
+These are very short, but I wanted to fit this in a short amount of time.
+Real applications should probably use approx. `ni = 50000` with appropriate burn-in/thinning to get good sampling behavior for this model.
+
+```{r jags-dims}
+jags_dims = c(
+  ni = 50000,  # number of post-burn-in samples per chain
+  nb = 1000,  # number of burn-in samples
+  nt = 2,     # thinning rate
+  nc = 2      # number of chains
+)
+```
+
+## Step 6: Run MCMC with JAGS
+
+This step is pretty standard.
+
+```{r run-jags, eval = params$run_jags, include = FALSE}
+# run JAGS
+post = jagsUI::jags.basic(
+  data = jags_data,
+  model.file = jags_file,
+  inits = jags_inits(jags_dims["nc"]),
+  parameters.to.save = jags_params,
+  n.adapt = 500,
+  n.iter = sum(jags_dims[c("ni", "nb")]),
+  n.thin = jags_dims["nt"],
+  n.burnin = jags_dims["nb"],
+  n.chains = jags_dims["nc"],
+  parallel = TRUE
+)
+
+# delete the jags model file
+unlink(jags_file)
+```
+
+```{r save-post, echo = FALSE, eval = params$run_jags & params$save_post}
+# save the posterior samples if ran MCMC and instructed to
+saveRDS(post, post_name)
+```
+
+```{r read-post, echo = FALSE, eval = !params$run_jags}
+# check if the file exists, if not, return useful message
+if (!file.exists(post_name)) {
+  stop ("No posterior samples saved for year: ", params$fit_year)
+}
+
+# read in posterior samples if not running MCMC
+post = readRDS(post_name)
+```
+
+## Step 7: Convergence Diagnosis {.tabset .tabset-pills}
+
+Note that the convergence doesn't look great, but this is probably mostly due to the few number of samples taken.
+But also note that some parameters have very very wide posteriors -- indicating a high degree of similarity with the prior and low degree of information content to inform them.
+
+### Survival
+
+Diagnostic plots for all `phi` parameters, excluding `phi[,1]` (recall names are `[mark_site,detection_event]`):g
+
+```{r, message = FALSE, fig.width = 8, fig.height = 7}
+diag_plots(post_remove(post, "phi[.,1]", ask = FALSE), "phi")
+```
+
+### Detection
+
+Diagnostic plots for all `p` parameters, excluding `p[3]` (recall names are `[detection_event]`:
+
+```{r, message = FALSE, fig.height = 6, fig.width = 5}
+diag_plots(post_remove(post, "p[5]", ask = FALSE), "^p[")
+```
+
+## Step 8: Make Inference {.tabset .tabset-pills}
+
+### Survival
+
+This plot displays all `phi` parameter estimates -- each boxplot represents the posterior summary for that parameter.
+Note: the high degree of uncertainty, especially how some of the more uncertain values are nearly identical to the prior (25%, 50%, and 75% quantiles of the prior shown as blue lines). This is due to low sample sizes for most mark sites, and very very few fish being detected in the later events.
+
+```{r phi-post-plot, fig.width = 4, fig.height = 8}
+# function to make boxplots showing posteriors for mark site-specific survival from event j-1 to j
+survival_plot = function(j) {
+  
+  # extract the posterior samples for survival
+  samps = post_subset(post, stringr::str_replace("phi[.,j]", "j", as.character(j)), matrix = TRUE)
+  colnames(samps) = site_names
+  
+  # create the name of the survival term
+  surv_term = paste0("j = ", j-1, " -> j = ", j)
+  
+  # make boxplots
+  boxplot(samps, outline = FALSE, main = paste0(params$fit_year, "; ", surv_term), ylim = c(0,1))
+  
+  # draw on the 25%, 50%, and 75% quantiles of the prior distribution
+  abline(h = qbeta(c(0.25, 0.5, 0.75), 1, 1), col = scales::alpha("blue", 0.5), lty = 2)
+}
+
+# make for all events
+par(mfrow = c(4,1), mgp = c(2,0.35,0), mar = c(1,1,2,1), tcl = -0.15, oma = c(2,2,0,0))
+junk = sapply(2:5, function(j) survival_plot(j))
+mtext(side = 1, outer = TRUE, line = 0.75, "Mark Site")
+mtext(side = 2, outer = TRUE, line = 0.75, "Survival Probability")
+```
+
+### Detection
+
+This plot displays all `p` parameter estimates -- each boxplot represents the posterior summary for that parameter.
+Note the parameter uncertainty for the estuary detection probability.
+This is because no fish were ever observed passing BON coming upstream.
+
+```{r p-post-plot, fig.width = 6, fig.height = 4}
+# extract posterior samples of detection probability
+dev.off()
+p = post_subset(post, "^p[", matrix = TRUE)
+colnames(p) = event_names
+
+# create the boxplot
+par(mgp = c(2,0.35,0), mar = c(3,3,2,1), tcl = -0.15)
+boxplot(p, outline = FALSE, xlab = "Detection Location", ylab = "Detection Probability")
+
+# draw on the 25%, 50%, and 75% quantiles of the prior distribution
+abline(h = qbeta(c(0.25, 0.5, 0.75), 1, 1), col = scales::alpha("blue", 0.5), lty = 2)
+```
+
+### Survivorship
+
+This plot displays the survivorship from tagging to any given detection location by mark site.
+The bar height represents the posterior mean and the error bars represent the central 95% credible interval.
+
+```{r sship-plot, fig.width = 6, fig.height = 4}
+mn = array_format(post_summ(post, "sship")["mean",])[,-1]
+lwr = array_format(post_summ(post, "sship")["2.5%",])[,-1]
+upr = array_format(post_summ(post, "sship")["97.5%",])[,-1]
+
+#rownames(mn) = site_names
+
+par(mgp = c(2,0.35,0), mar = c(3,3,2,1), tcl = -0.15)
+mp = barplot(mn, beside = TRUE, names.arg = event_names, ylim = c(0,1), legend = TRUE, args.legend = list(bty = "n", title = "Mark Site"), main = jags_data$mark_year, xlab = "Detection Location", ylab = "Survivorship from Tagging")
+segments(mp, lwr, mp, upr)
+```
+
+
+
+```{r export summary stats}
+#export survival probability
+
+ModelSummary = data.frame(t(post_summ(post, c("sship", "phi", "p"))))
+
+ModelSummary$ModelRun <- "ParrtoSmolt_allages"
+ModelSummary$Parameter <- rownames(ModelSummary)
+
+#Filter the model output to only include survship and detection prob from Galena
+ModelSummary <- ModelSummary %>% filter (
+                           Parameter == "sship[1,2]"| 
+                           Parameter == "sship[2,2]"| 
+                           Parameter == "sship[3,2]"|
+                           Parameter == "sship[4,2]"|
+                           Parameter == "sship[5,2]"|
+                           Parameter == "sship[6,2]"|
+                          
+                           Parameter == "sship[1,3]"| 
+                           Parameter == "sship[2,3]"| 
+                           Parameter == "sship[3,3]"| 
+                           Parameter == "sship[4,3]"| 
+                           Parameter == "sship[5,3]"| 
+                           Parameter == "sship[6,3]"| 
+                        
+            
+                           Parameter == "p[2]"|
+                           Parameter == "p[3]")
+
+
+ModelSummary$MarkSite <- NA
+ModelSummary$Year <- params$fit_year
+
+#Assign the MarkSite to the Model Output
+ModelSummary <- ModelSummary %>% mutate(MarkSite = case_when(
+                           Parameter == "sship[1,2]"~ "Spring_Spring_JDD", 
+                           Parameter == "sship[2,2]" ~"Per2_Fall_JDD",
+                           Parameter == "sship[3,2]" ~"MObelow_Fall_JDD",
+                           Parameter == "sship[4,2]" ~"Per3_Fall_JDD",
+                           Parameter == "sship[5,2]" ~"MOabove_Fall_JDD",
+                           Parameter == "sship[6,2]" ~"PF4_Fall_JDD",
+                          
+                           Parameter == "sship[1,3]"~ "Spriing_Spring_BON", 
+                           Parameter == "sship[2,3]" ~"Per2_Fall_BON",
+                           Parameter == "sship[3,3]" ~"MObelow_Fall_BON",
+                           Parameter == "sship[4,3]" ~"Per3_Fall_BON",
+                           Parameter == "sship[5,3]" ~"MOabove_Fall_BON",
+                           Parameter == "sship[6,3]" ~"PF4_Fall_BON",
+                           
+                           Parameter == "p[2]" ~ "BySite_SpringFall_JDD", 
+                           Parameter == "p[3]" ~ "BySite_SpringFall_BON"
+                           ))
+
+
+model_name = paste0("Parr_to_Smolt_allages", params$fit_year, ".rds")
+
+setwd("D:/2024_30Mile_Pub/R/Thirtymile_SMB_reduction/Survival/Modeled_Survival/Outputs")
+saveRDS(ModelSummary, model_name)
+
+
+
+```
+
